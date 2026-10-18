@@ -176,6 +176,7 @@ Most providers block your normal password for IMAP/SMTP. Create an **app passwor
 | Outlook / Microsoft 365 | https://account.microsoft.com/security → App passwords | `outlook.office365.com` : 993 | `smtp.office365.com` : 587 |
 | Zoho Mail (India) | Zoho Accounts → Security → App passwords | `imap.zoho.in` : 993 | `smtp.zoho.in` : 465 |
 | Yahoo | Account security → Generate app password | `imap.mail.yahoo.com` : 993 | `smtp.mail.yahoo.com` : 465 |
+| Strato | Your normal mailbox password | `imap.strato.de` : 993 | `smtp.strato.de` : 465 |
 | cPanel / custom domain | Your normal mailbox password | `mail.yourdomain.com` : 993 | `mail.yourdomain.com` : 465 |
 
 For Gmail, also make sure IMAP is enabled under Gmail **Settings → Forwarding and POP/IMAP**.

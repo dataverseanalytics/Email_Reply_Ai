@@ -6,6 +6,7 @@ const PROVIDERS = {
   gmail: { label: 'Gmail', imap_host: 'imap.gmail.com', imap_port: 993, smtp_host: 'smtp.gmail.com', smtp_port: 465 },
   outlook: { label: 'Outlook / Microsoft 365', imap_host: 'outlook.office365.com', imap_port: 993, smtp_host: 'smtp.office365.com', smtp_port: 587 },
   zoho: { label: 'Zoho Mail', imap_host: 'imap.zoho.in', imap_port: 993, smtp_host: 'smtp.zoho.in', smtp_port: 465 },
+  strato: { label: 'Strato', imap_host: 'imap.strato.de', imap_port: 993, smtp_host: 'smtp.strato.de', smtp_port: 465 },
   yahoo: { label: 'Yahoo', imap_host: 'imap.mail.yahoo.com', imap_port: 993, smtp_host: 'smtp.mail.yahoo.com', smtp_port: 465 },
 }
 
