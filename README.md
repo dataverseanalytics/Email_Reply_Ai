@@ -4,6 +4,7 @@ Replydesk reads your inbox, writes a personalized reply to each new email using 
 
 - **Login first.** Each person has their own account, and nobody can see another person's mail or answers.
 - **Fetches email** from any IMAP mailbox (Gmail, Outlook, Zoho, Yahoo, cPanel hosting and others) and **sends replies** over SMTP, threaded under the original email.
+- **Checks automatically.** The server checks each mailbox on a timer (every 5 minutes by default, set per user, or off), even with the browser closed.
 - **Drafts automatically.** New emails get an AI draft in the background. Your own messages and no-reply senders are skipped.
 - **Uses your saved answers.** You save common questions and their answers. The AI uses them as the facts but writes each reply fresh for the sender. If an email asks something your answers don't cover, the AI flags it instead of making up an answer.
 - **Adjusts with prompts.** Type an instruction ("mention weekend hours"), click one of your saved prompt buttons, or pick one of the three prompts the AI suggests for that email.
@@ -40,7 +41,7 @@ Replydesk reads your inbox, writes a personalized reply to each new email using 
         └── SMTP  ─── sends the replies you approve
 ```
 
-1. You click **Check for new mail**. The backend logs in to your mailbox over IMAP and copies the newest messages it hasn't seen yet.
+1. A background scheduler in the backend checks each mailbox on its own interval (or you click **Check for new mail**). It logs in over IMAP and copies the newest messages it hasn't seen yet.
 2. For each new email, a background task sends the AI the email, your saved answers and your profile (name, tone, signature, business details). The AI returns three things: a draft, a note listing anything to check, and three suggested refinement prompts.
 3. The email moves to **Ready to review**. You can edit the draft, rewrite it with a prompt, or send it. Sending goes over SMTP with `In-Reply-To` and `References` headers, so the reply lands in the same thread.
 
@@ -157,7 +158,7 @@ Other frontend scripts:
 3. **Set up how replies sound.** In **Settings → How replies sound**, add your tone (for example "warm, concise"), a short description of you or your business, and your signature.
 4. **Add saved answers.** In **Answers**, add the questions people ask you most often and how you answer them. These are the only facts the AI will state, so be specific (prices, timelines, policies, links).
 5. **Optional: add reply prompts.** **Prompts** comes with four buttons (More formal, Shorter, Decline politely, Ask for a call). Add your own, such as "Offer 10% off with code THANKS10".
-6. **Check for new mail.** On the **Inbox**, click *Check for new mail*. New emails are drafted in the background and show up under **Ready to review**.
+6. **Check for new mail.** Mail is checked automatically every 5 minutes (change this under **Settings → Check for new mail automatically**). Click *Check for new mail* on the **Inbox** to check right away. New emails are drafted in the background and show up under **Ready to review**. The Inbox shows when the last check ran, and any error from it.
 7. **Review and send.** Open an email and read the draft. Then:
    - Edit the draft directly in the reply box.
    - Type an instruction and click **Rewrite**, or click a prompt chip. Chips marked ✦ are suggested by the AI for that email.
@@ -185,6 +186,7 @@ Connection rules the app follows:
 - **IMAP:** port `993` uses SSL. Port `143` uses STARTTLS.
 - **SMTP:** port `465` uses SSL. Any other port (usually `587`) uses STARTTLS.
 - **Each check** reads the newest *N* emails in INBOX. *N* is the **Emails to check each time** setting (25 by default, 200 at most). Emails that are already stored are skipped.
+- **Automatic checks** run every 2, 5, 15, 30 or 60 minutes, or never. They run inside the backend process, so they stop while the backend is stopped and pick up again when it restarts. A failed check (wrong password, server down) is shown on the Inbox and retried after the next interval.
 - **Auto-drafting** can be turned off in Settings. Emails then land under **No draft**, and you click *Draft with AI* yourself.
 
 > Some Microsoft 365 organizations turn off password-based IMAP. If you can't create an app password there, ask your admin, or use a different mailbox.
@@ -209,7 +211,8 @@ Things you can change in the code:
 |---|---|
 | AI instructions (style, fact rules, sign-off) | `SYSTEM_PROMPT` in `backend/app/ai.py` |
 | Default prompt buttons for new accounts | `DEFAULT_PRESETS` in `backend/app/main.py` |
-| Which senders are never auto-drafted | `AUTOMATED_SENDER` regex in `backend/app/main.py` |
+| Which senders are never auto-drafted | `AUTOMATED_SENDER` regex in `backend/app/sync.py` |
+| How often the scheduler looks for due mailboxes | `SCHEDULER_TICK_SECONDS` in `backend/app/sync.py` (default 30) |
 | How long a login lasts | `SESSION_DAYS` in `backend/app/security.py` (default 7) |
 | Provider buttons on the Settings page | `PROVIDERS` in `frontend/src/pages/Settings.jsx` |
 
@@ -238,7 +241,7 @@ Every endpoint except register and login needs the `session` cookie, which is se
 | PUT | `/api/emails/{id}/draft` | Save manual edits `{draft_body}` |
 | POST | `/api/emails/{id}/send` | Send the reply `{draft_body}` |
 | PATCH | `/api/emails/{id}` | Skip an email or restore it `{status: "ignored" \| "new"}` |
-| GET | `/api/stats` | Counts per status, number of saved answers, and whether a mailbox is connected |
+| GET | `/api/stats` | Counts per status, number of saved answers, whether a mailbox is connected, and the auto-sync status (`sync_interval`, `last_synced_at`, `last_sync_error`) |
 
 ---
 
@@ -256,6 +259,7 @@ Email_Reply/
 │   └── app/
 │       ├── main.py           # FastAPI app and all routes
 │       ├── ai.py             # OpenAI drafting: prompt, structured JSON output, errors
+│       ├── sync.py           # mail checks, drafting, auto-sync scheduler (background thread)
 │       ├── mail_client.py    # IMAP fetch (read-only), HTML-to-text, SMTP send with threading
 │       ├── security.py       # bcrypt passwords, session cookies, password encryption
 │       └── db.py             # SQLite schema and connection helper
@@ -282,7 +286,7 @@ Email_Reply/
 |---|---|
 | `users` | Accounts, bcrypt password hashes, profile, tone, signature |
 | `sessions` | Login tokens with expiry |
-| `mail_accounts` | IMAP/SMTP settings and the encrypted mailbox password |
+| `mail_accounts` | IMAP/SMTP settings, the encrypted mailbox password, and the auto-sync interval with the last check's time and error |
 | `knowledge` | Saved questions and answers |
 | `prompt_presets` | Prompt buttons |
 | `emails` | Fetched emails plus their draft, the AI's note, suggested prompts and status |
@@ -298,7 +302,8 @@ The dev setup is meant for running on your own machine. To host it for other peo
    ```bash
    uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
    ```
-   Keep one worker. Background drafting runs inside the server process, and SQLite works best with a single writer.
+   Keep **exactly one** worker. The auto-sync scheduler and background drafting run inside the server process, so more workers would check each mailbox more than once. SQLite also works best with a single writer.
+   Run it under a process manager (systemd, NSSM on Windows, or Docker with `restart: always`) so automatic checks survive reboots.
 3. **Put a reverse proxy in front** (Nginx or Caddy) on one domain over HTTPS. Serve `frontend/dist/` as static files, with a fallback to `index.html` for client-side routes, and forward `/api/` to `127.0.0.1:8000`. Example Nginx config:
    ```nginx
    server {
@@ -312,7 +317,6 @@ The dev setup is meant for running on your own machine. To host it for other peo
    - Set `secure=True` in `_set_cookie()` in `backend/app/main.py`, so the cookie is only sent over HTTPS.
    - Set `APP_SECRET_KEY` in the environment instead of relying on `data/secret.key`, and back up `data/`.
    - Add rate limiting on `/api/auth/login`, for example at the proxy.
-   - To check mail on a schedule instead of by button, call `POST /api/emails/sync` on a timer for each user, or add a scheduler such as APScheduler.
 
 ---
 
@@ -325,7 +329,9 @@ The dev setup is meant for running on your own machine. To host it for other peo
 | Drafts fail with "OpenAI API key is missing or invalid" | Check `OPENAI_API_KEY` in `backend/.env`, then restart the backend |
 | "Rate limited (or out of credit) on OpenAI" | Add billing or credit at https://platform.openai.com/settings/organization/billing, or wait and try again |
 | "AI service error (404)… model" | Your account can't use that model. Set `OPENAI_MODEL` to one it can, such as `gpt-5.4-mini` or `gpt-4.1` |
-| An email is stuck on **Drafting** | The backend restarted mid-draft. Open the email and click **Draft with AI** |
+| An email is stuck on **Drafting** | The backend stopped mid-draft. It's drafted again automatically on the next start. You can also click **Draft with AI** |
+| "Last check failed" on the Inbox | The automatic check couldn't log in or reach the server. Fix the details in Settings, or wait for the next check if the server was down |
+| New mail isn't appearing automatically | Make sure the backend is running and **Check for new mail automatically** isn't set to Off. Checks start about 30 seconds after the interval passes |
 | Every request returns 401 after login | Open the app at `http://localhost:5173` rather than `127.0.0.1:8000`, so requests go through the Vite proxy |
 | Saved mailbox stopped working after moving servers | `data/secret.key` didn't move with the database. Copy it over, or re-enter the mailbox password in Settings |
 | `Activate.ps1 cannot be loaded` | Run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` |

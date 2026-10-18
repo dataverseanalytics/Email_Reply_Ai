@@ -31,7 +31,10 @@ CREATE TABLE IF NOT EXISTS mail_accounts (
     password_enc TEXT NOT NULL,
     from_address TEXT NOT NULL,
     auto_draft INTEGER NOT NULL DEFAULT 1,
-    fetch_limit INTEGER NOT NULL DEFAULT 25
+    fetch_limit INTEGER NOT NULL DEFAULT 25,
+    sync_interval INTEGER NOT NULL DEFAULT 5,     -- minutes between automatic checks; 0 = off
+    last_synced_at TEXT NOT NULL DEFAULT '',
+    last_sync_error TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS knowledge (
@@ -80,10 +83,25 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
+# Columns added after the first release; init_db adds any that an existing database is missing.
+ADDED_COLUMNS = {
+    "mail_accounts": {
+        "sync_interval": "INTEGER NOT NULL DEFAULT 5",
+        "last_synced_at": "TEXT NOT NULL DEFAULT ''",
+        "last_sync_error": "TEXT NOT NULL DEFAULT ''",
+    },
+}
+
+
 def init_db() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with connect() as conn:
         conn.executescript(SCHEMA)
+        for table, columns in ADDED_COLUMNS.items():
+            existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+            for name, decl in columns.items():
+                if name not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
 
 def get_db():

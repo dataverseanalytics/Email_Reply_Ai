@@ -1,6 +1,5 @@
 import json
-import re
-from datetime import datetime, timezone
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -10,15 +9,28 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 from fastapi import BackgroundTasks, Cookie, Depends, FastAPI, HTTPException, Response  # noqa: E402
 from pydantic import BaseModel, EmailStr, Field  # noqa: E402
 
-from . import ai, mail_client  # noqa: E402
-from .db import connect, get_db, init_db  # noqa: E402
+from . import mail_client  # noqa: E402
+from .db import get_db, init_db  # noqa: E402
 from .security import (  # noqa: E402
-    SESSION_COOKIE, SESSION_DAYS, create_session, current_user, decrypt, encrypt,
-    hash_password, verify_password,
+    SESSION_COOKIE, SESSION_DAYS, create_session, current_user, encrypt, hash_password,
+    verify_password,
+)
+from .sync import (  # noqa: E402
+    NoMailAccount, load_account, now, run_draft, run_drafts, start_scheduler, stop_scheduler,
+    sync_account, user_lock,
 )
 
-app = FastAPI(title="AI Email Reply")
 init_db()
+
+
+@asynccontextmanager
+async def lifespan(app):
+    start_scheduler()  # checks each mailbox on its own interval; see sync.py
+    yield
+    stop_scheduler()
+
+
+app = FastAPI(title="AI Email Reply", lifespan=lifespan)
 
 DEFAULT_PRESETS = [
     ("More formal", "Make the tone more formal and polished."),
@@ -26,13 +38,6 @@ DEFAULT_PRESETS = [
     ("Decline politely", "Politely decline the request while keeping the relationship warm."),
     ("Ask for a call", "Suggest a short call to discuss and ask for their availability."),
 ]
-AUTOMATED_SENDER = re.compile(r"no-?reply|do-?not-?reply|mailer-daemon|notifications?@", re.I)
-
-
-def now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
 # ---------- Auth ----------
 
 class RegisterIn(BaseModel):
@@ -121,15 +126,7 @@ class MailAccountIn(BaseModel):
     from_address: EmailStr
     auto_draft: bool = True
     fetch_limit: int = Field(default=25, ge=1, le=200)
-
-
-def load_account(conn, user_id: int) -> dict | None:
-    row = conn.execute("SELECT * FROM mail_accounts WHERE user_id = ?", (user_id,)).fetchone()
-    if not row:
-        return None
-    acc = dict(row)
-    acc["password"] = decrypt(acc.pop("password_enc"))
-    return acc
+    sync_interval: int = Field(default=5, ge=0, le=1440)  # minutes between automatic checks; 0 = off
 
 
 @app.get("/api/mail-account")
@@ -155,14 +152,16 @@ def save_mail_account(body: MailAccountIn, user=Depends(current_user), conn=Depe
         raise HTTPException(400, f"Could not connect: {e}")
     conn.execute(
         """INSERT INTO mail_accounts (user_id, imap_host, imap_port, smtp_host, smtp_port, username,
-               password_enc, from_address, auto_draft, fetch_limit)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               password_enc, from_address, auto_draft, fetch_limit, sync_interval)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(user_id) DO UPDATE SET imap_host=excluded.imap_host, imap_port=excluded.imap_port,
                smtp_host=excluded.smtp_host, smtp_port=excluded.smtp_port, username=excluded.username,
                password_enc=excluded.password_enc, from_address=excluded.from_address,
-               auto_draft=excluded.auto_draft, fetch_limit=excluded.fetch_limit""",
+               auto_draft=excluded.auto_draft, fetch_limit=excluded.fetch_limit,
+               sync_interval=excluded.sync_interval""",
         (user["id"], body.imap_host, body.imap_port, body.smtp_host, body.smtp_port, body.username,
-         encrypt(password), body.from_address, int(body.auto_draft), body.fetch_limit),
+         encrypt(password), body.from_address, int(body.auto_draft), body.fetch_limit,
+         body.sync_interval),
     )
     return {"ok": True}
 
@@ -242,69 +241,18 @@ def email_out(row, full: bool = False) -> dict:
     return d
 
 
-def run_draft(user_id: int, email_id: int, instruction: str = "", revise: bool = False) -> None:
-    """Generate a draft and store it. Uses its own connection so it can run in the background."""
-    conn = connect()
-    try:
-        user = dict(conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone())
-        email = dict(conn.execute("SELECT * FROM emails WHERE id = ? AND user_id = ?",
-                                  (email_id, user_id)).fetchone())
-        knowledge = [dict(r) for r in conn.execute(
-            "SELECT question, answer FROM knowledge WHERE user_id = ? ORDER BY id", (user_id,))]
-        try:
-            result = ai.draft_reply(user, knowledge, email, instruction,
-                                    previous_draft=email["draft_body"] if revise else "")
-            conn.execute(
-                """UPDATE emails SET status = 'drafted', draft_body = ?, draft_note = ?, draft_prompt = ?,
-                       suggested_prompts = ?, draft_error = '', drafted_at = ? WHERE id = ?""",
-                (result["reply"], result["note"], instruction, json.dumps(result["suggested_prompts"]),
-                 now(), email_id),
-            )
-        except ai.DraftError as e:
-            conn.execute(
-                "UPDATE emails SET status = CASE WHEN draft_body = '' THEN 'new' ELSE 'drafted' END, "
-                "draft_error = ? WHERE id = ?", (str(e), email_id))
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def run_drafts(user_id: int, email_ids: list[int]) -> None:
-    for eid in email_ids:
-        run_draft(user_id, eid)
-
-
 @app.post("/api/emails/sync")
-def sync_emails(background: BackgroundTasks, user=Depends(current_user), conn=Depends(get_db)):
-    acc = load_account(conn, user["id"])
-    if not acc:
-        raise HTTPException(400, "Connect your mailbox in Settings first")
-    known = {r["imap_uid"] for r in conn.execute("SELECT imap_uid FROM emails WHERE user_id = ?",
-                                                 (user["id"],))}
-    try:
-        fetched = mail_client.fetch_recent(acc, known)
-    except Exception as e:
-        raise HTTPException(502, f"Mail server error: {e}")
-
-    to_draft = []
-    for m in fetched:
-        own = m["from_address"].lower() == acc["from_address"].lower()
-        automated = bool(AUTOMATED_SENDER.search(m["from_address"]))
-        auto = acc["auto_draft"] and not own and not automated
-        cur = conn.execute(
-            """INSERT OR IGNORE INTO emails (user_id, imap_uid, message_id, references_hdr, from_name,
-                   from_address, subject, received_at, body, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (user["id"], m["imap_uid"], m["message_id"], m["references_hdr"], m["from_name"],
-             m["from_address"], m["subject"], m["received_at"], m["body"],
-             "drafting" if auto else ("ignored" if own or automated else "new")),
-        )
-        if auto and cur.rowcount:
-            to_draft.append(cur.lastrowid)
-    conn.commit()
-    if to_draft:
-        background.add_task(run_drafts, user["id"], to_draft)
-    return {"fetched": len(fetched), "drafting": len(to_draft)}
+def sync_emails(background: BackgroundTasks, user=Depends(current_user)):
+    with user_lock(user["id"]):  # waits if an automatic check is mid-way for this user
+        try:
+            result = sync_account(user["id"])
+        except NoMailAccount:
+            raise HTTPException(400, "Connect your mailbox in Settings first")
+        except Exception as e:
+            raise HTTPException(502, f"Mail server error: {e}")
+    if result["to_draft"]:
+        background.add_task(run_drafts, user["id"], result["to_draft"])
+    return {"fetched": result["fetched"], "drafting": len(result["to_draft"])}
 
 
 @app.get("/api/emails")
@@ -392,5 +340,11 @@ def stats(user=Depends(current_user), conn=Depends(get_db)):
                         (user["id"],)).fetchall()
     counts = {r["status"]: r["c"] for r in rows}
     kb = conn.execute("SELECT COUNT(*) FROM knowledge WHERE user_id = ?", (user["id"],)).fetchone()[0]
-    has_account = bool(conn.execute("SELECT 1 FROM mail_accounts WHERE user_id = ?", (user["id"],)).fetchone())
-    return {"counts": counts, "knowledge": kb, "has_account": has_account}
+    acc = conn.execute("SELECT sync_interval, last_synced_at, last_sync_error FROM mail_accounts "
+                       "WHERE user_id = ?", (user["id"],)).fetchone()
+    return {
+        "counts": counts,
+        "knowledge": kb,
+        "has_account": bool(acc),
+        "sync": dict(acc) if acc else None,
+    }

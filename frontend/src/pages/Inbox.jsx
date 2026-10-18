@@ -20,6 +20,31 @@ function formatDate(iso) {
     : d.toLocaleDateString([], { month: 'short', day: 'numeric' })
 }
 
+function timeAgo(iso) {
+  if (!iso) return 'never'
+  const mins = Math.floor((Date.now() - new Date(iso)) / 60000)
+  if (mins < 1) return 'just now'
+  if (mins < 60) return `${mins} min ago`
+  const hours = Math.floor(mins / 60)
+  return hours < 24 ? `${hours} h ago` : new Date(iso).toLocaleDateString()
+}
+
+function SyncStatus({ sync }) {
+  if (!sync) return null
+  const every = sync.sync_interval >= 60 ? 'every hour' : `every ${sync.sync_interval} min`
+  return (
+    <div className="sync-status">
+      <p className="muted small">
+        {sync.sync_interval > 0 ? `Checks automatically ${every}` : 'Automatic checks are off'}
+        {' · '}last checked {timeAgo(sync.last_synced_at)}
+      </p>
+      {sync.last_sync_error && (
+        <p className="error small" role="alert">Last check failed: {sync.last_sync_error}</p>
+      )}
+    </div>
+  )
+}
+
 export default function Inbox() {
   const [stats, setStats] = useState(null)
   const [filter, setFilter] = useState('drafted')
@@ -39,13 +64,22 @@ export default function Inbox() {
 
   useEffect(() => { refresh().catch((e) => setNotice({ type: 'error', text: e.message })) }, [refresh])
 
-  // Poll while background drafts are being written.
+  // Poll fast while background drafts are being written; otherwise slowly, to pick up mail
+  // the server fetched on its own schedule.
   const drafting = stats?.counts?.drafting ?? 0
+  const autoSync = (stats?.sync?.sync_interval ?? 0) > 0
   useEffect(() => {
-    if (!drafting) return
-    const t = setInterval(() => refresh().catch(() => {}), 3000)
+    if (!drafting && !autoSync) return
+    const t = setInterval(() => refresh().catch(() => {}), drafting ? 3000 : 30000)
     return () => clearInterval(t)
-  }, [drafting, refresh])
+  }, [drafting, autoSync, refresh])
+
+  // Re-render every 30s so "last checked" stays accurate.
+  const [, setTick] = useState(0)
+  useEffect(() => {
+    const t = setInterval(() => setTick((n) => n + 1), 30000)
+    return () => clearInterval(t)
+  }, [])
 
   const sync = async () => {
     setSyncing(true)
@@ -95,6 +129,7 @@ export default function Inbox() {
             {syncing ? 'Checking…' : 'Check for new mail'}
           </button>
         </header>
+        <SyncStatus sync={stats?.sync} />
         {notice && <p className={`notice ${notice.type}`} role="status">{notice.text}</p>}
         <div className="filters" role="tablist">
           {FILTERS.map((f) => (

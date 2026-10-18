@@ -10,7 +10,16 @@ const PROVIDERS = {
   yahoo: { label: 'Yahoo', imap_host: 'imap.mail.yahoo.com', imap_port: 993, smtp_host: 'smtp.mail.yahoo.com', smtp_port: 465 },
 }
 
-const BLANK = { imap_host: '', imap_port: 993, smtp_host: '', smtp_port: 465, username: '', password: '', from_address: '', auto_draft: true, fetch_limit: 25 }
+const BLANK = { imap_host: '', imap_port: 993, smtp_host: '', smtp_port: 465, username: '', password: '', from_address: '', auto_draft: true, fetch_limit: 25, sync_interval: 5 }
+
+const SYNC_INTERVALS = [
+  [0, 'Off (only when I click)'],
+  [2, 'Every 2 minutes'],
+  [5, 'Every 5 minutes'],
+  [15, 'Every 15 minutes'],
+  [30, 'Every 30 minutes'],
+  [60, 'Every hour'],
+]
 
 export default function Settings() {
   return (
@@ -86,14 +95,22 @@ function MailboxForm() {
         <label>SMTP port<input type="number" value={acc.smtp_port} onChange={set('smtp_port', true)} required /></label>
       </div>
       <div className="row-2">
-        <label className="check">
-          <input type="checkbox" checked={acc.auto_draft} onChange={(e) => setAcc({ ...acc, auto_draft: e.target.checked })} />
-          Draft replies automatically when new mail arrives
+        <label>Check for new mail automatically
+          <select value={acc.sync_interval} onChange={set('sync_interval', true)}>
+            {SYNC_INTERVALS.map(([v, label]) => <option key={v} value={v}>{label}</option>)}
+          </select>
         </label>
         <label>Emails to check each time
           <input type="number" min={1} max={200} value={acc.fetch_limit} onChange={set('fetch_limit', true)} />
         </label>
       </div>
+      <label className="check">
+        <input type="checkbox" checked={acc.auto_draft} onChange={(e) => setAcc({ ...acc, auto_draft: e.target.checked })} />
+        Draft replies automatically when new mail arrives
+      </label>
+      <p className="muted small">
+        Automatic checks run on the server, so they keep going with this page closed, as long as the backend is running.
+      </p>
       {status && <p className={status.type === 'ok' ? 'notice ok' : 'error'} role="status">{status.text}</p>}
       <div className="actions">
         <button className="primary" disabled={busy}>{busy ? 'Testing connection…' : connected ? 'Save mailbox' : 'Connect mailbox'}</button>
